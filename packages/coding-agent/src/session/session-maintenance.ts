@@ -71,7 +71,6 @@ import type { ContextUsageBreakdown, HandoffResult, SessionHandoffOptions } from
 import { findCompactMode } from "./compact-modes";
 import {
 	type CompactionMethod,
-	canUseRemoteCompaction,
 	DEFAULT_COMPACTION_METHOD_ORDER,
 	resolveCompactionMethodOrder,
 	resolveMethodSettings,
@@ -755,7 +754,12 @@ export class SessionMaintenance {
 			for (let index = methodOffset; index < methods.length; index++) {
 				const method = methods[index];
 				if (method === "remote") {
-					if (canUseRemoteCompaction(activeModel, resolveMethodSettings(compactionSettings, method))) {
+					const remoteSettings = resolveMethodSettings(compactionSettings, method);
+					if (
+						remoteSettings.remoteEndpoint !== undefined ||
+						this.#getProviderRemoteCompactionCandidates(this.#host.modelRegistry.getAvailable(), remoteSettings)
+							.length > 0
+					) {
 						selectedMethod = method;
 						selectedMethodIndex = index;
 						break;
@@ -786,14 +790,9 @@ export class SessionMaintenance {
 			const effectiveSettings = resolveMethodSettings(compactionSettings, selectedMethod);
 			const availableModels = this.#host.modelRegistry.getAvailable();
 			const requireProviderRemote = selectedMethod === "remote" && !effectiveSettings.remoteEndpoint;
-			const compactionCandidates = this.#getCompactionModelCandidates(
-				availableModels,
-				requireProviderRemote
-					? candidate =>
-							candidate.provider === activeModel.provider &&
-							shouldUseProviderNativeCompaction(candidate, effectiveSettings)
-					: undefined,
-			);
+			const compactionCandidates = requireProviderRemote
+				? this.#getProviderRemoteCompactionCandidates(availableModels, effectiveSettings)
+				: this.#getCompactionModelCandidates(availableModels);
 			if (requireProviderRemote && compactionCandidates.length === 0) {
 				this.#host.emitNotice(
 					"warning",
@@ -1332,14 +1331,10 @@ export class SessionMaintenance {
 			// No hookCompaction is passed above, so "fromHook" is unreachable;
 			// the guard just narrows the union.
 			if (compactionPrep.kind === "fromHook") return clear();
-			const candidates = this.#getCompactionModelCandidates(
-				this.#host.modelRegistry.getAvailable(),
+			const candidates =
 				method === "remote" && !effectiveSettings.remoteEndpoint
-					? candidate =>
-							candidate.provider === model.provider &&
-							shouldUseProviderNativeCompaction(candidate, effectiveSettings)
-					: undefined,
-			);
+					? this.#getProviderRemoteCompactionCandidates(this.#host.modelRegistry.getAvailable(), effectiveSettings)
+					: this.#getCompactionModelCandidates(this.#host.modelRegistry.getAvailable());
 			if (candidates.length === 0) return clear();
 			const codexCompaction = createCodexCompactionContext({
 				trigger: "auto",
@@ -2085,6 +2080,18 @@ export class SessionMaintenance {
 
 	#getCompactionModelCandidates(availableModels: Model[], filter?: (model: Model) => boolean): Model[] {
 		return this.resolveCompactionModelCandidates(this.#model, availableModels, filter);
+	}
+
+	#getProviderRemoteCompactionCandidates(availableModels: Model[], settings: EngineCompactionSettings): Model[] {
+		const currentModel = this.#model;
+		const configuredTarget = currentModel
+			? resolveCompactionConfiguredTarget(currentModel, availableModels)
+			: undefined;
+		const provider = configuredTarget?.provider ?? currentModel?.provider;
+		return this.#getCompactionModelCandidates(
+			availableModels,
+			candidate => candidate.provider === provider && shouldUseProviderNativeCompaction(candidate, settings),
+		);
 	}
 
 	resolveCompactionModelCandidates(
@@ -2850,14 +2857,18 @@ export class SessionMaintenance {
 		let method: CompactionMethod | undefined;
 		for (let index = startIndex; index < methods.length; index++) {
 			const candidate = methods[index];
-			const available =
-				candidate === "remote"
-					? canUseRemoteCompaction(this.#model, resolveMethodSettings(compactionSettings, candidate))
-					: candidate === "snapcompact"
-						? this.#model?.input.includes("image") === true
-						: candidate === "handoff"
-							? reason !== "overflow"
-							: true;
+			let available: boolean;
+			if (candidate === "remote") {
+				const remoteSettings = resolveMethodSettings(compactionSettings, candidate);
+				available =
+					remoteSettings.remoteEndpoint !== undefined ||
+					this.#getProviderRemoteCompactionCandidates(this.#host.modelRegistry.getAvailable(), remoteSettings)
+						.length > 0;
+			} else if (candidate === "snapcompact") {
+				available = this.#model?.input.includes("image") === true;
+			} else {
+				available = candidate !== "handoff" || reason !== "overflow";
+			}
 			if (!available) continue;
 			method = candidate;
 			methodIndex = index;
@@ -3373,14 +3384,10 @@ export class SessionMaintenance {
 				details = snapcompactResult.details;
 				preserveData = { ...(compactionPrep.preserveData ?? {}), ...(snapcompactResult.preserveData ?? {}) };
 			} else {
-				const candidates = this.#getCompactionModelCandidates(
-					availableModels,
+				const candidates =
 					method === "remote" && !effectiveSettings.remoteEndpoint
-						? candidate =>
-								candidate.provider === this.#model?.provider &&
-								shouldUseProviderNativeCompaction(candidate, effectiveSettings)
-						: undefined,
-				);
+						? this.#getProviderRemoteCompactionCandidates(availableModels, effectiveSettings)
+						: this.#getCompactionModelCandidates(availableModels);
 				const retrySettings = this.#host.settings.getGroup("retry");
 				const telemetry = resolveTelemetry(this.#host.agent.telemetry, this.#host.sessionId());
 				let compactResult: CompactionResult | undefined;

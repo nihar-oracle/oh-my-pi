@@ -32,12 +32,24 @@ describe("issue #986 compaction auth fallback", () => {
 		tempDir.removeSync();
 	});
 
-	async function createSession(options?: { fallbackModelRole?: string; configureFallbackAuth?: boolean }) {
-		const currentModel = getBundledModel("openai-codex", "gpt-5.4-mini");
+	async function createSession(options?: {
+		fallbackModelRole?: string;
+		configureFallbackAuth?: boolean;
+		virtualCompactionModel?: boolean;
+	}) {
+		const directModel = getBundledModel("openai-codex", "gpt-5.4-mini");
 		const fallbackModel = getBundledModel("anthropic", "claude-sonnet-4-5");
-		if (!currentModel || !fallbackModel) {
+		if (!directModel || !fallbackModel) {
 			throw new Error("Expected bundled test models to exist");
 		}
+		const currentModel = options?.virtualCompactionModel
+			? {
+					...directModel,
+					provider: "pi-router",
+					id: "auto",
+					compactionModel: `${directModel.provider}/${directModel.id}`,
+				}
+			: directModel;
 
 		const settings = Settings.isolated({
 			"compaction.keepRecentTokens": 1,
@@ -57,7 +69,7 @@ describe("issue #986 compaction auth fallback", () => {
 		});
 
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey(currentModel.provider, "codex-token");
+		authStorage.setRuntimeApiKey(directModel.provider, "codex-token");
 		if (options?.configureFallbackAuth !== false) {
 			authStorage.setRuntimeApiKey(fallbackModel.provider, "anthropic-token");
 		}
@@ -82,8 +94,26 @@ describe("issue #986 compaction auth fallback", () => {
 			session.agent.appendMessage(assistant);
 			session.sessionManager.appendMessage(assistant);
 		}
-		return { currentModel, fallbackModel };
+		return { currentModel, directModel, fallbackModel };
 	}
+
+	it("uses a virtual model's configured native compaction target", async () => {
+		const { directModel } = await createSession({ virtualCompactionModel: true });
+		const attemptedModels: string[] = [];
+		vi.spyOn(compactionModule, "compact").mockImplementation(async (preparation, model) => {
+			attemptedModels.push(`${model.provider}/${model.id}`);
+			return {
+				summary: "native compaction",
+				shortSummary: "native",
+				firstKeptEntryId: preparation.firstKeptEntryId,
+				tokensBefore: preparation.tokensBefore,
+			};
+		});
+
+		await session.compact();
+
+		expect(attemptedModels).toEqual([`${directModel.provider}/${directModel.id}`]);
+	});
 
 	async function createAutoNativeFallbackSession(options?: {
 		sameProviderNativeEnabled?: boolean;
